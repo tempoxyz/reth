@@ -14,6 +14,14 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// Default capacity for the transaction batch request channel.
+///
+/// This bounds the number of pending batch requests to prevent unbounded memory growth
+/// under denial-of-service attacks where malicious users blast large transactions and quickly
+/// cancel requests. The value of 2048 provides enough headroom for burst scenarios while ensuring
+/// backpressure is applied before memory usage becomes problematic.
+const DEFAULT_BATCH_CHANNEL_CAPACITY: usize = 2048;
+
 /// A single batch transaction request
 /// All transactions processed through the batcher are considered local
 /// transactions (`TransactionOrigin::Local`) when inserted into the pool.
@@ -46,7 +54,7 @@ pub struct BatchTxProcessor<Pool: TransactionPool> {
     max_batch_size: usize,
     buf: Vec<BatchTxRequest<Pool::Transaction>>,
     #[pin]
-    request_rx: mpsc::UnboundedReceiver<BatchTxRequest<Pool::Transaction>>,
+    request_rx: mpsc::Receiver<BatchTxRequest<Pool::Transaction>>,
 }
 
 impl<Pool> BatchTxProcessor<Pool>
@@ -57,8 +65,8 @@ where
     pub fn new(
         pool: Pool,
         max_batch_size: usize,
-    ) -> (Self, mpsc::UnboundedSender<BatchTxRequest<Pool::Transaction>>) {
-        let (request_tx, request_rx) = mpsc::unbounded_channel();
+    ) -> (Self, mpsc::Sender<BatchTxRequest<Pool::Transaction>>) {
+        let (request_tx, request_rx) = mpsc::channel(DEFAULT_BATCH_CHANNEL_CAPACITY);
 
         let processor = Self { pool, max_batch_size, buf: Vec::with_capacity(1), request_rx };
 
@@ -100,7 +108,12 @@ where
 
         loop {
             // Drain all available requests from the receiver
-            ready!(this.request_rx.poll_recv_many(cx, this.buf, *this.max_batch_size));
+            let n = ready!(this.request_rx.poll_recv_many(cx, this.buf, *this.max_batch_size));
+
+            // Channel closed and no remaining items - shutdown gracefully
+            if n == 0 && this.buf.is_empty() {
+                return Poll::Ready(());
+            }
 
             if !this.buf.is_empty() {
                 let batch = std::mem::take(this.buf);
@@ -112,9 +125,6 @@ where
 
                 continue;
             }
-
-            // No requests available, return Pending to wait for more
-            return Poll::Pending;
         }
     }
 }
@@ -167,7 +177,9 @@ mod tests {
             let tx = MockTransaction::legacy().with_nonce(i).with_gas_price(100);
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-            request_tx.send(BatchTxRequest::new(tx, response_tx)).expect("Could not send batch tx");
+            request_tx
+                .try_send(BatchTxRequest::new(tx, response_tx))
+                .expect("Could not send batch tx");
             responses.push(response_rx);
         }
 
@@ -198,7 +210,7 @@ mod tests {
             let tx = MockTransaction::legacy().with_nonce(i).with_gas_price(100);
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             let request = BatchTxRequest::new(tx, response_tx);
-            request_tx.send(request).expect("Could not send batch tx");
+            request_tx.try_send(request).expect("Could not send batch tx");
             results.push(response_rx);
         }
 
@@ -229,7 +241,7 @@ mod tests {
             let request_tx_clone = request_tx.clone();
 
             let tx_fut = async move {
-                request_tx_clone.send(request).expect("Could not send batch tx");
+                request_tx_clone.try_send(request).expect("Could not send batch tx");
                 response_rx.await.expect("Could not receive batch response")
             };
             futures.push(tx_fut);
