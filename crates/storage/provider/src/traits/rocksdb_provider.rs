@@ -2,12 +2,13 @@ use crate::{
     either_writer::{RawRocksDBBatch, RocksBatchArg, RocksTxRefArg},
     providers::RocksDBProvider,
 };
+use reth_storage_api::StorageSettingsCache;
 use reth_storage_errors::provider::ProviderResult;
 
 /// `RocksDB` provider factory.
 ///
 /// This trait provides access to the `RocksDB` provider
-pub trait RocksDBProviderFactory {
+pub trait RocksDBProviderFactory: StorageSettingsCache {
     /// Returns the `RocksDB` provider.
     fn rocksdb_provider(&self) -> RocksDBProvider;
 
@@ -21,18 +22,21 @@ pub trait RocksDBProviderFactory {
     /// Executes a closure with a `RocksDB` transaction for reading.
     ///
     /// This helper encapsulates all the cfg-gated `RocksDB` transaction handling for reads.
+    /// On legacy MDBX-only nodes (where `any_in_rocksdb()` is false), this skips creating
+    /// the RocksDB transaction entirely, avoiding unnecessary overhead.
     fn with_rocksdb_tx<F, R>(&self, f: F) -> ProviderResult<R>
     where
         F: FnOnce(RocksTxRefArg<'_>) -> ProviderResult<R>,
     {
         #[cfg(all(unix, feature = "rocksdb"))]
         {
-            let rocksdb = self.rocksdb_provider();
-            let tx = rocksdb.tx();
-            f(&tx)
+            if self.cached_storage_settings().any_in_rocksdb() {
+                let rocksdb = self.rocksdb_provider();
+                let tx = rocksdb.tx();
+                return f(Some(&tx));
+            }
         }
-        #[cfg(not(all(unix, feature = "rocksdb")))]
-        f(())
+        f(None)
     }
 
     /// Executes a closure with a `RocksDB` batch, automatically registering it for commit.
