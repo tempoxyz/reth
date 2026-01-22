@@ -88,6 +88,25 @@ impl RocksDBProvider {
     pub const fn clear<T>(&self) -> ProviderResult<()> {
         Ok(())
     }
+
+    /// Flushes all column family memtables to SST files (stub implementation).
+    ///
+    /// This is a no-op since there is no `RocksDB` when the feature is disabled.
+    pub const fn flush(&self) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    /// Schedules a flush to occur on the next appropriate commit point (stub implementation).
+    ///
+    /// This is a no-op since there is no `RocksDB` when the feature is disabled.
+    pub const fn schedule_next_flush(&self) {}
+
+    /// Flushes if a flush was scheduled, then resets the flag (stub implementation).
+    ///
+    /// Always returns `Ok(false)` since there is no `RocksDB` when the feature is disabled.
+    pub const fn flush_if_scheduled(&self) -> ProviderResult<bool> {
+        Ok(false)
+    }
 }
 
 impl DatabaseMetrics for RocksDBProvider {

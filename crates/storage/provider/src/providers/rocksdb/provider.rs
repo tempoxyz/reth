@@ -23,7 +23,7 @@ use reth_storage_errors::{
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, CompactionPri, DBCompressionType,
-    DBRawIteratorWithThreadMode, IteratorMode, OptimisticTransactionDB,
+    DBRawIteratorWithThreadMode, FlushOptions, IteratorMode, OptimisticTransactionDB,
     OptimisticTransactionOptions, Options, Transaction, WriteBatchWithTransaction, WriteOptions,
     DB,
 };
@@ -31,7 +31,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Instant,
 };
@@ -279,7 +282,10 @@ impl RocksDBBuilder {
                         code: -1,
                     }))
                 })?;
-            Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::ReadOnly { db, metrics })))
+            Ok(RocksDBProvider(Arc::new(RocksDBProviderShared {
+                inner: RocksDBProviderInner::ReadOnly { db, metrics },
+                flush_scheduled: AtomicBool::new(false),
+            })))
         } else {
             // Use OptimisticTransactionDB for MDBX-like transaction semantics (read-your-writes,
             // rollback) OptimisticTransactionDB uses optimistic concurrency control (conflict
@@ -293,7 +299,10 @@ impl RocksDBBuilder {
                             code: -1,
                         }))
                     })?;
-            Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::ReadWrite { db, metrics })))
+            Ok(RocksDBProvider(Arc::new(RocksDBProviderShared {
+                inner: RocksDBProviderInner::ReadWrite { db, metrics },
+                flush_scheduled: AtomicBool::new(false),
+            })))
         }
     }
 }
@@ -314,7 +323,24 @@ macro_rules! compress_to_buf_or_ref {
 
 /// `RocksDB` provider for auxiliary storage layer beside main database MDBX.
 #[derive(Debug)]
-pub struct RocksDBProvider(Arc<RocksDBProviderInner>);
+pub struct RocksDBProvider(Arc<RocksDBProviderShared>);
+
+/// Shared state for `RocksDB` provider, wrapped in an `Arc`.
+struct RocksDBProviderShared {
+    /// The database state (read-write or read-only).
+    inner: RocksDBProviderInner,
+    /// Flag indicating a flush should occur on the next appropriate commit point.
+    flush_scheduled: AtomicBool,
+}
+
+impl fmt::Debug for RocksDBProviderShared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RocksDBProviderShared")
+            .field("inner", &self.inner)
+            .field("flush_scheduled", &self.flush_scheduled.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 /// Inner state for `RocksDB` provider.
 enum RocksDBProviderInner {
@@ -483,6 +509,27 @@ impl RocksDBProviderInner {
 
         stats
     }
+
+    /// Flushes all column family memtables to SST files.
+    ///
+    /// This allows `RocksDB` to delete older WAL segments and reclaim disk space.
+    /// The operation waits for the flush to complete before returning.
+    fn flush(&self) -> Result<(), rocksdb::Error> {
+        let Self::ReadWrite { db, .. } = self else {
+            return Ok(());
+        };
+
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true);
+
+        for cf_name in ROCKSDB_TABLES {
+            if let Some(cf) = db.cf_handle(cf_name) {
+                db.flush_cf_opt(&cf, &flush_opts)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl fmt::Debug for RocksDBProviderInner {
@@ -580,7 +627,46 @@ impl RocksDBProvider {
 
     /// Returns `true` if this provider is in read-only mode.
     pub fn is_read_only(&self) -> bool {
-        matches!(self.0.as_ref(), RocksDBProviderInner::ReadOnly { .. })
+        matches!(&self.0.inner, RocksDBProviderInner::ReadOnly { .. })
+    }
+
+    /// Flushes all column family memtables to SST files.
+    ///
+    /// This forces `RocksDB` to write all in-memory data (memtables) to SST files on disk,
+    /// allowing older WAL segments to be deleted and reclaiming disk space. This is useful
+    /// during pipeline sync where large amounts of data are written to `RocksDB`.
+    ///
+    /// The operation waits for the flush to complete before returning.
+    ///
+    /// This is a no-op in read-only mode.
+    #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
+    pub fn flush(&self) -> ProviderResult<()> {
+        self.0.inner.flush().map_err(|e| {
+            ProviderError::Database(DatabaseError::Other(format!(
+                "RocksDB flush failed: {e}"
+            )))
+        })
+    }
+
+    /// Schedules a flush to occur on the next appropriate commit point.
+    ///
+    /// The flush flag is automatically reset after the flush occurs via
+    /// [`Self::flush_if_scheduled`].
+    pub fn schedule_next_flush(&self) {
+        self.0.flush_scheduled.store(true, Ordering::Release);
+    }
+
+    /// Flushes if a flush was scheduled, then resets the flag.
+    ///
+    /// Returns `Ok(true)` if flush occurred, `Ok(false)` if not scheduled.
+    #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
+    pub fn flush_if_scheduled(&self) -> ProviderResult<bool> {
+        if self.0.flush_scheduled.swap(false, Ordering::AcqRel) {
+            self.flush()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Creates a new transaction with MDBX-like semantics (read-your-writes, rollback).
@@ -593,7 +679,7 @@ impl RocksDBProvider {
     pub fn tx(&self) -> RocksTx<'_> {
         let write_options = WriteOptions::default();
         let txn_options = OptimisticTransactionOptions::default();
-        let inner = self.0.db_rw().transaction_opt(&write_options, &txn_options);
+        let inner = self.0.inner.db_rw().transaction_opt(&write_options, &txn_options);
         RocksTx { inner, provider: self }
     }
 
@@ -614,7 +700,7 @@ impl RocksDBProvider {
 
     /// Gets the column family handle for a table.
     fn get_cf_handle<T: Table>(&self) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
-        self.0.cf_handle::<T>()
+        self.0.inner.cf_handle::<T>()
     }
 
     /// Executes a function and records metrics with the given operation and table name.
@@ -624,10 +710,10 @@ impl RocksDBProvider {
         table: &'static str,
         f: impl FnOnce(&Self) -> R,
     ) -> R {
-        let start = self.0.metrics().map(|_| Instant::now());
+        let start = self.0.inner.metrics().map(|_| Instant::now());
         let res = f(self);
 
-        if let (Some(start), Some(metrics)) = (start, self.0.metrics()) {
+        if let (Some(start), Some(metrics)) = (start, self.0.inner.metrics()) {
             metrics.record_operation(operation, table, start.elapsed());
         }
 
@@ -645,12 +731,13 @@ impl RocksDBProvider {
         key: &<T::Key as Encode>::Encoded,
     ) -> ProviderResult<Option<T::Value>> {
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
-            let result = this.0.get_cf(this.get_cf_handle::<T>()?, key.as_ref()).map_err(|e| {
-                ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
-                    message: e.to_string().into(),
-                    code: -1,
-                }))
-            })?;
+            let result =
+                this.0.inner.get_cf(this.get_cf_handle::<T>()?, key.as_ref()).map_err(|e| {
+                    ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                        message: e.to_string().into(),
+                        code: -1,
+                    }))
+                })?;
 
             Ok(result.and_then(|value| T::Value::decompress(&value).ok()))
         })
@@ -681,7 +768,7 @@ impl RocksDBProvider {
             let mut buf = Vec::new();
             let value_bytes = compress_to_buf_or_ref!(buf, value).unwrap_or(&buf);
 
-            this.0.put_cf(this.get_cf_handle::<T>()?, key, value_bytes).map_err(|e| {
+            this.0.inner.put_cf(this.get_cf_handle::<T>()?, key, value_bytes).map_err(|e| {
                 ProviderError::Database(DatabaseError::Write(Box::new(DatabaseWriteError {
                     info: DatabaseErrorInfo { message: e.to_string().into(), code: -1 },
                     operation: DatabaseWriteOperation::PutUpsert,
@@ -698,12 +785,14 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     pub fn delete<T: Table>(&self, key: T::Key) -> ProviderResult<()> {
         self.execute_with_operation_metric(RocksDBOperation::Delete, T::NAME, |this| {
-            this.0.delete_cf(this.get_cf_handle::<T>()?, key.encode().as_ref()).map_err(|e| {
-                ProviderError::Database(DatabaseError::Delete(DatabaseErrorInfo {
-                    message: e.to_string().into(),
-                    code: -1,
-                }))
-            })
+            this.0.inner.delete_cf(this.get_cf_handle::<T>()?, key.encode().as_ref()).map_err(
+                |e| {
+                    ProviderError::Database(DatabaseError::Delete(DatabaseErrorInfo {
+                        message: e.to_string().into(),
+                        code: -1,
+                    }))
+                },
+            )
         })
     }
 
@@ -715,7 +804,7 @@ impl RocksDBProvider {
     pub fn clear<T: Table>(&self) -> ProviderResult<()> {
         let cf = self.get_cf_handle::<T>()?;
 
-        self.0.delete_range_cf(cf, &[] as &[u8], &[0xFF; 256]).map_err(|e| {
+        self.0.inner.delete_range_cf(cf, &[] as &[u8], &[0xFF; 256]).map_err(|e| {
             ProviderError::Database(DatabaseError::Delete(DatabaseErrorInfo {
                 message: e.to_string().into(),
                 code: -1,
@@ -729,7 +818,7 @@ impl RocksDBProvider {
     pub fn first<T: Table>(&self) -> ProviderResult<Option<(T::Key, T::Value)>> {
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
             let cf = this.get_cf_handle::<T>()?;
-            let mut iter = this.0.iterator_cf(cf, IteratorMode::Start);
+            let mut iter = this.0.inner.iterator_cf(cf, IteratorMode::Start);
 
             match iter.next() {
                 Some(Ok((key_bytes, value_bytes))) => {
@@ -754,7 +843,7 @@ impl RocksDBProvider {
     pub fn last<T: Table>(&self) -> ProviderResult<Option<(T::Key, T::Value)>> {
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
             let cf = this.get_cf_handle::<T>()?;
-            let mut iter = this.0.iterator_cf(cf, IteratorMode::End);
+            let mut iter = this.0.inner.iterator_cf(cf, IteratorMode::End);
 
             match iter.next() {
                 Some(Ok((key_bytes, value_bytes))) => {
@@ -780,7 +869,7 @@ impl RocksDBProvider {
     /// Returns decoded `(Key, Value)` pairs in key order.
     pub fn iter<T: Table>(&self) -> ProviderResult<RocksDBIter<'_, T>> {
         let cf = self.get_cf_handle::<T>()?;
-        let iter = self.0.iterator_cf(cf, IteratorMode::Start);
+        let iter = self.0.inner.iterator_cf(cf, IteratorMode::Start);
         Ok(RocksDBIter { inner: iter, _marker: std::marker::PhantomData })
     }
 
@@ -788,7 +877,7 @@ impl RocksDBProvider {
     ///
     /// Returns a vector of (`table_name`, `estimated_keys`, `estimated_size_bytes`) tuples.
     pub fn table_stats(&self) -> Vec<RocksDBTableStats> {
-        self.0.table_stats()
+        self.0.inner.table_stats()
     }
 
     /// Creates a raw iterator over all entries in the specified table.
@@ -796,7 +885,7 @@ impl RocksDBProvider {
     /// Returns raw `(key_bytes, value_bytes)` pairs without decoding.
     pub fn raw_iter<T: Table>(&self) -> ProviderResult<RocksDBRawIter<'_>> {
         let cf = self.get_cf_handle::<T>()?;
-        let iter = self.0.iterator_cf(cf, IteratorMode::Start);
+        let iter = self.0.inner.iterator_cf(cf, IteratorMode::Start);
         Ok(RocksDBRawIter { inner: iter })
     }
 
@@ -817,9 +906,10 @@ impl RocksDBProvider {
         let start_bytes = start_key.encode();
 
         // Create a forward iterator starting from our seek position.
-        let iter = self
-            .0
-            .iterator_cf(cf, IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward));
+        let iter = self.0.inner.iterator_cf(
+            cf,
+            IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward),
+        );
 
         let mut result = Vec::new();
         for item in iter {
@@ -866,9 +956,10 @@ impl RocksDBProvider {
         let start_key = StorageShardedKey::new(address, storage_key, 0u64);
         let start_bytes = start_key.encode();
 
-        let iter = self
-            .0
-            .iterator_cf(cf, IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward));
+        let iter = self.0.inner.iterator_cf(
+            cf,
+            IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward),
+        );
 
         let mut result = Vec::new();
         for item in iter {
@@ -887,10 +978,9 @@ impl RocksDBProvider {
                     result.push((key, value));
                 }
                 Err(e) => {
-                    return Err(ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
-                        message: e.to_string().into(),
-                        code: -1,
-                    })));
+                    return Err(ProviderError::Database(DatabaseError::Read(
+                        DatabaseErrorInfo { message: e.to_string().into(), code: -1 },
+                    )));
                 }
             }
         }
@@ -983,7 +1073,7 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = batch.len(), batch_size = batch.size_in_bytes()))]
     pub fn commit_batch(&self, batch: WriteBatchWithTransaction<true>) -> ProviderResult<()> {
-        self.0.db_rw().write_opt(batch, &WriteOptions::default()).map_err(|e| {
+        self.0.inner.db_rw().write_opt(batch, &WriteOptions::default()).map_err(|e| {
             ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
                 message: e.to_string().into(),
                 code: -1,
@@ -1170,12 +1260,14 @@ impl<'a> RocksDBBatch<'a> {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = self.inner.len(), batch_size = self.inner.size_in_bytes()))]
     pub fn commit(self) -> ProviderResult<()> {
-        self.provider.0.db_rw().write_opt(self.inner, &WriteOptions::default()).map_err(|e| {
-            ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
-                message: e.to_string().into(),
-                code: -1,
-            }))
-        })
+        self.provider.0.inner.db_rw().write_opt(self.inner, &WriteOptions::default()).map_err(
+            |e| {
+                ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            },
+        )
     }
 
     /// Returns the number of write operations (puts + deletes) queued in this batch.
@@ -1710,7 +1802,7 @@ impl<'db> RocksTx<'db> {
             })
         };
 
-        let cf = self.provider.0.cf_handle_rw(T::NAME)?;
+        let cf = self.provider.0.inner.cf_handle_rw(T::NAME)?;
 
         // Create a raw iterator to access key bytes directly.
         let mut iter: DBRawIteratorWithThreadMode<'_, Transaction<'_, OptimisticTransactionDB>> =

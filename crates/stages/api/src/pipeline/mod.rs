@@ -9,7 +9,7 @@ use reth_primitives_traits::constants::BEACON_CONSENSUS_REORG_UNWIND_DEPTH;
 use reth_provider::{
     providers::ProviderNodeTypes, BlockHashReader, BlockNumReader, ChainStateBlockReader,
     ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderFactory,
-    PruneCheckpointReader, StageCheckpointReader, StageCheckpointWriter,
+    PruneCheckpointReader, RocksDBProviderFactory, StageCheckpointReader, StageCheckpointWriter,
 };
 use reth_prune::PrunerBuilder;
 use reth_static_file::StaticFileProducer;
@@ -394,6 +394,9 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
 
                         provider_rw.commit()?;
 
+                        // Flush RocksDB memtables to SST files to keep WAL size bounded.
+                        self.provider_factory.rocksdb_provider().flush()?;
+
                         stage.post_unwind_commit()?;
 
                         provider_rw = self.provider_factory.database_provider_rw()?;
@@ -483,6 +486,9 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
 
                     // Commit processed data to the database.
                     provider_rw.commit()?;
+
+                    // Flush RocksDB memtables to SST files to keep WAL size bounded.
+                    self.provider_factory.rocksdb_provider().flush()?;
 
                     // Invoke stage post commit hook.
                     self.stage(stage_index).post_execute_commit()?;
