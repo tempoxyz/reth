@@ -714,8 +714,13 @@ where
 
         // Wrap the state hook with metrics collection
         let inner_hook = Box::new(handle.state_hook());
-        let state_hook =
-            MeteredStateHook { metrics: self.metrics.executor_metrics().clone(), inner_hook };
+        let state_hook = MeteredStateHook {
+            metrics: self.metrics.executor_metrics().clone(),
+            inner_hook,
+            accounts_total: 0,
+            storage_slots_total: 0,
+            bytecodes_total: 0,
+        };
 
         let transaction_count = input.transaction_count();
         let executor = executor.with_state_hook(Some(Box::new(state_hook)));
