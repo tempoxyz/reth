@@ -212,8 +212,6 @@ struct MeteredStateHook {
 
 impl OnStateHook for MeteredStateHook {
     fn on_state(&mut self, source: StateChangeSource, state: &EvmState) {
-        // Metrics are now recorded once per block in record_block_execution()
-        // to avoid O(n) state iteration per transaction.
         self.inner_hook.on_state(source, state);
     }
 }
