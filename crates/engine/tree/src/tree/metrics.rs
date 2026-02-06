@@ -74,7 +74,13 @@ impl EngineApiMetrics {
         // clone here is cheap, all the metrics are Option<Arc<_>>. additionally
         // they are globally registered so that the data recorded in the hook will
         // be accessible.
-        let wrapper = MeteredStateHook { metrics: self.executor.clone(), inner_hook: state_hook };
+        let wrapper = MeteredStateHook {
+            metrics: self.executor.clone(),
+            inner_hook: state_hook,
+            accounts_total: 0,
+            storage_slots_total: 0,
+            bytecodes_total: 0,
+        };
 
         let mut senders = Vec::with_capacity(transaction_count);
         let mut executor = executor.with_state_hook(Some(Box::new(wrapper)));

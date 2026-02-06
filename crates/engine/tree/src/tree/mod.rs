@@ -201,25 +201,38 @@ pub enum TreeAction {
     },
 }
 
-/// Wrapper struct that combines metrics and state hook
-struct MeteredStateHook {
+/// Wrapper struct that combines metrics and state hook.
+///
+/// Accumulates per-transaction state metrics (accounts, storage slots, bytecodes loaded)
+/// and records them as a single histogram observation per block on drop, avoiding the overhead
+/// of 3 histogram recordings per transaction.
+pub(crate) struct MeteredStateHook {
     metrics: reth_evm::metrics::ExecutorMetrics,
     inner_hook: Box<dyn OnStateHook>,
+    accounts_total: usize,
+    storage_slots_total: usize,
+    bytecodes_total: usize,
 }
 
 impl OnStateHook for MeteredStateHook {
     fn on_state(&mut self, source: StateChangeSource, state: &EvmState) {
-        // Update the metrics for the number of accounts, storage slots and bytecodes loaded
         let accounts = state.keys().len();
         let storage_slots = state.values().map(|account| account.storage.len()).sum::<usize>();
         let bytecodes = state.values().filter(|account| !account.info.is_empty_code_hash()).count();
 
-        self.metrics.accounts_loaded_histogram.record(accounts as f64);
-        self.metrics.storage_slots_loaded_histogram.record(storage_slots as f64);
-        self.metrics.bytecodes_loaded_histogram.record(bytecodes as f64);
+        self.accounts_total += accounts;
+        self.storage_slots_total += storage_slots;
+        self.bytecodes_total += bytecodes;
 
-        // Call the original state hook
         self.inner_hook.on_state(source, state);
+    }
+}
+
+impl Drop for MeteredStateHook {
+    fn drop(&mut self) {
+        self.metrics.accounts_loaded_histogram.record(self.accounts_total as f64);
+        self.metrics.storage_slots_loaded_histogram.record(self.storage_slots_total as f64);
+        self.metrics.bytecodes_loaded_histogram.record(self.bytecodes_total as f64);
     }
 }
 
